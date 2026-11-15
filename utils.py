@@ -594,7 +594,7 @@ def _imagen_nvidia(prompt, ancho, alto, intentos=3):
     pide 1024x1024 y recorta. Reintenta con espera ante 429/5xx."""
     url = f"{NVIDIA_IMAGEN_URL}/{MODEL_IMAGEN}"
     cabeceras = {"Authorization": f"Bearer {NVIDIA_API_KEY}", "Accept": "application/json"}
-    texto = prompt.strip()[:400] + _ESTILO
+    texto = prompt.strip()[:600] + _ESTILO
     medidas = [(1024, 768), (1024, 1024)]
     ultimo = None
     for (w, h) in medidas:
@@ -633,19 +633,23 @@ _nvidia_img_pausado_hasta = 0.0   # tras un timeout, no se vuelve a intentar NVI
 def generar_imagen_ia(prompt, ancho=800, alto=600, intentos=2):
     """Devuelve (bytes_jpeg, 'image/jpeg'). Primero NVIDIA (FLUX); si falla, Pollinations (si está activado)."""
     global _nvidia_img_pausado_hasta
+    motivo_nvidia = "NVIDIA en pausa tras un timeout reciente"
     if time.time() >= _nvidia_img_pausado_hasta:
         try:
             return _imagen_nvidia(prompt, ancho, alto)
         except Exception as e:
-            print(f"[IMG] NVIDIA no generó la imagen: {str(e)[:160]}", flush=True)
-            if "Timeout" in str(e):
-                _nvidia_img_pausado_hasta = time.time() + 300
-                print("[IMG] NVIDIA no responde: las siguientes imágenes usarán el respaldo durante 5 minutos.", flush=True)
+            motivo_nvidia = str(e)[:200]
+            print(f"[IMG] NVIDIA no generó la imagen: {motivo_nvidia}", flush=True)
             if not IMAGEN_RESPALDO_POLLINATIONS:
                 raise
-    elif not IMAGEN_RESPALDO_POLLINATIONS:
-        raise RuntimeError("NVIDIA en pausa por timeout y el respaldo está desactivado")
-    return _imagen_pollinations(prompt, ancho, alto, intentos)
+            if "Timeout" in motivo_nvidia:   # solo tiene sentido pausar NVIDIA si hay un respaldo que funcione
+                _nvidia_img_pausado_hasta = time.time() + 300
+                print("[IMG] NVIDIA no responde: las siguientes imágenes usarán el respaldo durante 5 minutos.", flush=True)
+    try:
+        return _imagen_pollinations(prompt, ancho, alto, intentos)
+    except Exception as e2:
+        # Que la bitácora muestre también por qué falló NVIDIA, no solo el respaldo
+        raise RuntimeError(f"NVIDIA: {motivo_nvidia} | respaldo: {e2}") from None
 
 
 def _imagen_pollinations(prompt, ancho=800, alto=600, intentos=2):

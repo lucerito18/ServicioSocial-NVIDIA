@@ -50,7 +50,7 @@ class Ilustrador(Agente):
 
     def _planear(self, slides, marcadas, imagenes_pdf, feedback):
         resumen = [{"diapositiva": i, "titulo": slides[i - 1].get("title", ""),
-                    "texto": _texto(slides[i - 1])[:240]} for i in marcadas]
+                    "texto": _texto(slides[i - 1])[:700]} for i in marcadas]
         catalogo = [{"id": im["id"], "pagina": im["pagina"], "tipo": im.get("tipo", ""),
                      "descripcion": im.get("descripcion", "")} for im in imagenes_pdf]
         prompt = (
@@ -64,15 +64,22 @@ class Ilustrador(Agente):
             "Ademas, para cada una escribe:\n"
             "- 'consulta': busqueda corta EN INGLES (2 a 5 palabras) para Wikimedia Commons, sobre algo "
             "concreto y fotografiable que ilustre su contenido.\n"
-            "- 'prompt_ia': descripcion EN INGLES (10 a 25 palabras) de una ilustracion sencilla y "
-            "conceptual del mismo tema, para generarla con IA (sin texto ni letras en la imagen).\n"
+            "- 'prompt_ia': descripcion EN INGLES (25 a 45 palabras) de UNA escena visual concreta y especifica de "
+            "lo que dice ESA diapositiva: quien aparece (personas, roles), que objetos o lugares se ven y que "
+            "accion ocurre, usando sus ideas y ejemplos reales (cifras, casos, terminos clave). Evita simbolos "
+            "genericos como engranes, flechas, focos, checklists o apretones de manos, salvo que sean justo el "
+            "tema. Dos diapositivas no deben tener la misma escena. Sin texto ni letras en la imagen.\n"
             'Responde {"razonamiento": "<como decidiste>", "imagenes": [{"diapositiva": N, "fuente": "pdf|web|ia", '
             '"imagen_pdf": "<id o null>", "consulta": "...", "prompt_ia": "...", "por_que": "<una frase>"}]}\n\n'
             "IMAGENES DEL PDF:\n" + (json.dumps(catalogo, ensure_ascii=False) if catalogo else "(ninguna)")
             + "\n\nDIAPOSITIVAS:\n" + json.dumps(resumen, ensure_ascii=False)
         )
         d = parsear_json(llamar_llm(SYS_ILUSTRADOR_PLAN, con_feedback(prompt, feedback)))
-        por_num = {x["diapositiva"]: x for x in d.get("imagenes", [])
+        if isinstance(d, list):          # algunos modelos devuelven la lista de imagenes sin el objeto exterior
+            d = {"imagenes": d}
+        if not isinstance(d, dict):
+            raise ValueError("el plan de imagenes no es un objeto JSON")
+        por_num ={x["diapositiva"]: x for x in d.get("imagenes", [])
                    if isinstance(x, dict) and isinstance(x.get("diapositiva"), int)}
         ids_pdf = {im["id"] for im in imagenes_pdf}
         plan, completadas, ya_asignadas = [], [], set()
@@ -213,7 +220,7 @@ class Ilustrador(Agente):
             "id": f"ia-{i}", "fuente": "ia", "ruta": ruta,
             "titulo": f"Ilustracion IA ({prompt_ia[:45]}...)",
             "ancho": w, "alto": al,
-            "razon": f"Ilustracion conceptual generada con IA para '{sl.get('title', '')}'",
+            "razon": f"Ilustracion generada con IA a partir del contenido de '{sl.get('title', '')}'",
         }, "generada con IA"
 
     def _procesar_diapositiva(self, p, slides, imagenes_pdf, usadas):
@@ -306,4 +313,3 @@ class Ilustrador(Agente):
             "detalle": "\n".join(lineas),
             "notas": f"Se completaron busquedas por defecto en {completadas}" if completadas else "",
         }
-        
