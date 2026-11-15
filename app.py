@@ -3,11 +3,39 @@
 import json
 import os
 import tempfile
+import threading
+import time
 
 import gradio as gr
 
 from utils import ErrorPipeline
 from agentes.jefe import Jefe
+
+
+def _memoria_mb():
+    """Memoria residente del proceso (Render Free tiene 512 MB). Lee /proc; si no existe, devuelve -1."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for linea in f:
+                if linea.startswith("VmRSS:"):
+                    return int(linea.split()[1]) // 1024
+    except Exception:
+        pass
+    return -1
+
+
+def _latido(cada=30):
+    """Imprime una línea cada 'cada' s solo mientras hay un PDF en proceso. Si los logs muestran estas líneas
+    pero ninguna del pipeline, el pipeline está esperando a NVIDIA; si dejan de salir, la app está congelada o reiniciada."""
+    while True:
+        time.sleep(cada)
+        if _EN_PROCESO[0] > 0:
+            print(f"[LATIDO] {time.strftime('%H:%M:%S')} memoria={_memoria_mb()} MB hilos={threading.active_count()}",
+                  flush=True)
+
+
+_EN_PROCESO = [0]
+threading.Thread(target=_latido, daemon=True).start()
 
 
 def process_pdf(pdf_file):
@@ -19,6 +47,9 @@ def process_pdf(pdf_file):
     ruta_log = os.path.join(carpeta, "bitacora.json")
     jefe = Jefe()
 
+    _EN_PROCESO[0] += 1
+    inicio = time.time()
+    exito = False
     try:
         jefe.coordinar(pdf_file, ruta_pptx, carpeta)
         exito = True
@@ -28,6 +59,9 @@ def process_pdf(pdf_file):
         jefe._anotar("Sistema", "Control de errores y seguridad", "-", "🛑 Error bloqueado", 0,
                      {"recibio": str(pdf_file), "razonamiento": f"{type(e).__name__}: {e}"})
         exito = False
+    finally:
+        _EN_PROCESO[0] -= 1
+        print(f"[SISTEMA] Procesamiento terminado en {time.time() - inicio:.0f}s", flush=True)
 
     with open(ruta_log, "w", encoding="utf-8") as f:
         json.dump(jefe.log, f, ensure_ascii=False, indent=2)
