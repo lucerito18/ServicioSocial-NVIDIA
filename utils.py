@@ -21,7 +21,8 @@ from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.oxml.ns import qn
 from pptx.util import Pt
 
-from config import (CHARS_POR_DIAPOSITIVA, IMAGEN_RESPALDO_POLLINATIONS, LIMITE_TEXTO_REVISION, MAX_DIAP_POR_TEMA,
+from config import (CHARS_POR_DIAPOSITIVA, IMAGEN_RESPALDO_POLLINATIONS, IMAGEN_TIMEOUT, LIMITE_TEXTO_REVISION,
+                    MAX_DIAP_POR_TEMA,
                     MAX_DIAPOSITIVAS, MAX_TOKENS_SALIDA, MODEL_IMAGEN, MODEL_NAME, MODEL_VISION, NVIDIA_API_KEY,
                     NVIDIA_BASE_URL,
                     NVIDIA_IMAGEN_URL, PROPORCION_IMAGENES, SIN_RAZONAMIENTO, TIMEOUT_LLM, USER_AGENT)
@@ -599,7 +600,7 @@ def _imagen_nvidia(prompt, ancho, alto, intentos=3):
     for (w, h) in medidas:
         for k in range(intentos):
             try:
-                r = _post_con_limite(url, 90, headers=cabeceras,
+                r = _post_con_limite(url, IMAGEN_TIMEOUT, headers=cabeceras,
                                      json={"prompt": texto, "width": w, "height": h, "seed": 0, "steps": 4})
                 if r.status_code in (400, 422) and (w, h) != medidas[-1]:
                     ultimo = RuntimeError(f"HTTP {r.status_code} con {w}x{h}: {r.text[:200]}")
@@ -619,19 +620,31 @@ def _imagen_nvidia(prompt, ancho, alto, intentos=3):
                 return _a_jpeg_exacto(base64.b64decode(b64), ancho, alto), "image/jpeg"
             except Exception as e:
                 ultimo = e
+                if "Timeout" in f"{type(e).__name__} {e}":
+                    raise RuntimeError(ocultar_secretos(f"Timeout: NVIDIA no generó la imagen en {IMAGEN_TIMEOUT}s")) from None
                 if isinstance(e, (RuntimeError, ValueError)) and "HTTP 4" in str(e) and "HTTP 429" not in str(e):
                     raise RuntimeError(ocultar_secretos(str(e))) from None   # 401/403/404: no sirve reintentar
     raise RuntimeError(ocultar_secretos(f"{type(ultimo).__name__}: {ultimo}"))
 
 
+_nvidia_img_pausado_hasta = 0.0   # tras un timeout, no se vuelve a intentar NVIDIA durante unos minutos
+
+
 def generar_imagen_ia(prompt, ancho=800, alto=600, intentos=2):
     """Devuelve (bytes_jpeg, 'image/jpeg'). Primero NVIDIA (FLUX); si falla, Pollinations (si está activado)."""
-    try:
-        return _imagen_nvidia(prompt, ancho, alto)
-    except Exception as e:
-        print(f"[IMG] NVIDIA no generó la imagen: {str(e)[:160]}", flush=True)
-        if not IMAGEN_RESPALDO_POLLINATIONS:
-            raise
+    global _nvidia_img_pausado_hasta
+    if time.time() >= _nvidia_img_pausado_hasta:
+        try:
+            return _imagen_nvidia(prompt, ancho, alto)
+        except Exception as e:
+            print(f"[IMG] NVIDIA no generó la imagen: {str(e)[:160]}", flush=True)
+            if "Timeout" in str(e):
+                _nvidia_img_pausado_hasta = time.time() + 300
+                print("[IMG] NVIDIA no responde: las siguientes imágenes usarán el respaldo durante 5 minutos.", flush=True)
+            if not IMAGEN_RESPALDO_POLLINATIONS:
+                raise
+    elif not IMAGEN_RESPALDO_POLLINATIONS:
+        raise RuntimeError("NVIDIA en pausa por timeout y el respaldo está desactivado")
     return _imagen_pollinations(prompt, ancho, alto, intentos)
 
 

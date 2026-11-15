@@ -21,7 +21,8 @@ MAX_TOKENS_SALIDA = int(os.environ.get("NVIDIA_MAX_TOKENS", "8192"))   # bájalo
 MODEL_IMAGEN = os.environ.get("NVIDIA_IMAGE_MODEL", "black-forest-labs/flux.1-schnell")
 NVIDIA_IMAGEN_URL = os.environ.get("NVIDIA_IMAGE_URL", "https://ai.api.nvidia.com/v1/genai")
 # Si NVIDIA falla (429, sin créditos...), se intenta Pollinations antes de dejar la diapositiva sin imagen.
-IMAGEN_RESPALDO_POLLINATIONS = os.environ.get("IMAGEN_RESPALDO", "1").lower() not in ("0", "false", "no")
+IMAGEN_TIMEOUT = int(os.environ.get("NVIDIA_IMAGE_TIMEOUT", "45"))   # segundos máximos por imagen en NVIDIA
+IMAGEN_RESPALDO_POLLINATIONS =os.environ.get("IMAGEN_RESPALDO", "1").lower() not in ("0", "false", "no")
 
 MAX_INTENTOS = 3      # cuántas veces el Jefe deja reintentar a un agente
 TITULO_FUENTES = "Fuentes y créditos"
