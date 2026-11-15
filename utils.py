@@ -8,6 +8,8 @@ import math
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from html import unescape
 from urllib.parse import quote, urlparse
 
@@ -171,6 +173,19 @@ def _a_mensajes(system_instruction, prompt):
     return [{"role": "user", "content": contenido}], True
 
 
+def _post_con_limite(url, limite, **kwargs):
+    """POST con límite de tiempo TOTAL. El 'timeout' de requests solo vigila la espera entre bytes: si el
+    servidor mantiene la conexión abierta sin contestar, nunca vence. Aquí se corta a los 'limite' segundos."""
+    ex = ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(requests.post, url, timeout=(15, limite), **kwargs)
+    try:
+        return fut.result(timeout=limite)
+    except FutureTimeout:
+        raise TimeoutError(f"Timeout: NVIDIA no respondió en {limite}s") from None
+    finally:
+        ex.shutdown(wait=False)
+
+
 def llamar_llm(system_instruction, prompt):
     """Una llamada a NVIDIA NIM (chat/completions) blindada con REGLA_BLINDAJE_SISTEMA.
     Reintenta con espera ante 429/5xx (el plan gratuito permite ~40 peticiones por minuto)."""
@@ -182,10 +197,13 @@ def llamar_llm(system_instruction, prompt):
         cuerpo["chat_template_kwargs"] = {"enable_thinking": False}
     cabeceras = {"Authorization": f"Bearer {NVIDIA_API_KEY}", "Accept": "application/json"}
     esperas = (5, 12, 25, 40)
+    n_timeouts = 0
     for k in range(len(esperas) + 1):
         try:
-            r = requests.post(f"{NVIDIA_BASE_URL}/chat/completions", headers=cabeceras, json=cuerpo,
-                              timeout=TIMEOUT_LLM)
+            print(f"[LLM] Llamando a {cuerpo['model']} (intento {k + 1}, límite {TIMEOUT_LLM}s)...", flush=True)
+            t0 = time.time()
+            r = _post_con_limite(f"{NVIDIA_BASE_URL}/chat/completions", TIMEOUT_LLM, headers=cabeceras, json=cuerpo)
+            print(f"[LLM] Respuesta en {time.time() - t0:.1f}s (HTTP {r.status_code})", flush=True)
             if r.status_code != 200:
                 raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
             texto = (r.json()["choices"][0]["message"].get("content") or "")
@@ -195,6 +213,10 @@ def llamar_llm(system_instruction, prompt):
             descripcion = ocultar_secretos(f"{type(e).__name__} {e}")
             print(f"[LLM] Aviso en intento {k + 1}: {descripcion[:160]}", flush=True)
             pasajero = any(t in descripcion for t in ("429", "502", "503", "504", "Timeout", "ConnectionError"))
+            if "Timeout" in descripcion:
+                n_timeouts += 1
+                if n_timeouts > 1:      # si ya se colgó dos veces, no seguir esperando más
+                    pasajero = False
             if not pasajero or k == len(esperas):
                 raise RuntimeError(descripcion) from None
             time.sleep(esperas[k])
@@ -577,8 +599,8 @@ def _imagen_nvidia(prompt, ancho, alto, intentos=3):
     for (w, h) in medidas:
         for k in range(intentos):
             try:
-                r = requests.post(url, headers=cabeceras, timeout=90,
-                                  json={"prompt": texto, "width": w, "height": h, "seed": 0, "steps": 4})
+                r = _post_con_limite(url, 90, headers=cabeceras,
+                                     json={"prompt": texto, "width": w, "height": h, "seed": 0, "steps": 4})
                 if r.status_code in (400, 422) and (w, h) != medidas[-1]:
                     ultimo = RuntimeError(f"HTTP {r.status_code} con {w}x{h}: {r.text[:200]}")
                     break                       # probar la siguiente medida
