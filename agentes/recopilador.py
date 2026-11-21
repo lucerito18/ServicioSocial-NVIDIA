@@ -17,6 +17,55 @@ las cadenas y cierra todas las comillas, llaves y corchetes.
 """
 
 
+def _normalizar(data):
+    """Fuerza la forma que espera el resto del sistema aunque el modelo se desvíe.
+
+    A veces el modelo devuelve 'secciones' como una lista de textos ("1. Tema...") en vez de
+    objetos {'tema', 'puntos'}, o 'puntos' como un solo texto. Sin esto, el Jefe revienta con
+    «'str' object has no attribute 'get'» y detiene toda la presentación."""
+    if not isinstance(data, dict):
+        data = {}
+
+    def _texto(valor):
+        if valor is None:
+            return ""
+        if isinstance(valor, dict):
+            return " ".join(_texto(v) for v in valor.values()).strip()
+        if isinstance(valor, (list, tuple)):
+            return " ".join(_texto(v) for v in valor).strip()
+        return str(valor).strip()
+
+    secciones = []
+    for sec in data.get("secciones") or []:
+        if isinstance(sec, str):
+            sec = {"tema": sec, "puntos": []}
+        if not isinstance(sec, dict):
+            continue
+        puntos = sec.get("puntos") or []
+        if isinstance(puntos, str):
+            puntos = [puntos]
+        elif isinstance(puntos, dict):
+            puntos = list(puntos.values())
+        puntos = [_texto(p) for p in puntos if _texto(p)]
+        secciones.append({"tema": _texto(sec.get("tema")) or "Tema", "puntos": puntos})
+
+    refs = data.get("referencias") or []
+    if isinstance(refs, str):
+        refs = [refs]
+    elif isinstance(refs, dict):
+        refs = list(refs.values())
+    refs = [_texto(r) for r in refs if _texto(r)][:8]
+
+    return {
+        "titulo_documento": _texto(data.get("titulo_documento")),
+        "subtitulo": _texto(data.get("subtitulo")),
+        "tema_general": _texto(data.get("tema_general")),
+        "razonamiento": _texto(data.get("razonamiento")),
+        "secciones": secciones,
+        "referencias": refs,
+    }
+
+
 def _fmt_secciones(data):
     partes = [
         f"Título: {data.get('titulo_documento', '')}",
@@ -25,6 +74,8 @@ def _fmt_secciones(data):
         "",
     ]
     for i, s in enumerate(data.get("secciones", []), 1):
+        if not isinstance(s, dict):
+            s = {"tema": str(s), "puntos": []}
         partes.append(f"Tema {i}: {s.get('tema', '?')}")
         for pt in s.get("puntos", []):
             partes.append(f"   - {pt}")
@@ -104,7 +155,7 @@ class Recopilador(Agente):
                                                             max(3, math.ceil(mx * frac)))
             prompt = self._prompt(bloque, mn_b, mx_b, (j, len(bloques)) if len(bloques) > 1 else None,
                                   entrada.get("paginas", "?"))
-            return parsear_json(llamar_llm(SYS_RECOPILADOR, con_feedback(prompt, feedback)))
+            return _normalizar(parsear_json(llamar_llm(SYS_RECOPILADOR, con_feedback(prompt, feedback))))
 
         def _leer_seguro(indice):
             """Nunca propaga la excepción: el bloque se reintenta una vez más abajo."""

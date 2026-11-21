@@ -133,7 +133,7 @@ class Jefe:
                      "pdfplumber; puede estar incompleta o alterada")
 
         elif nombre == "Recopilador":
-            secciones = s.get("secciones", [])
+            secciones = [x for x in (s.get("secciones") or []) if isinstance(x, dict)]
             _chk(c, "Trae título y subtítulo del documento",
                  s.get("titulo_documento") and s.get("subtitulo"), "Falta 'titulo_documento' o 'subtitulo'")
             _chk(c, "Título de máximo 14 palabras",
@@ -450,8 +450,9 @@ class Jefe:
                 "veredicto": str(d.get("veredicto", ""))}
 
     def _revision_ia_temas(self, salida):
+        secciones = [x for x in (salida.get("secciones") or []) if isinstance(x, dict)]
         temas = [{"numero": i, "tema": sec.get("tema"), "puntos": sec.get("puntos")}
-                 for i, sec in enumerate(salida.get("secciones", []), 1)]
+                 for i, sec in enumerate(secciones, 1)]
         prompt = (
             "Compara los TEMAS que extrajo el Recopilador con el DOCUMENTO original y revisa:\n"
             "1. 'temas_faltantes': secciones o ideas importantes del documento que no aparecen en ningún tema "
