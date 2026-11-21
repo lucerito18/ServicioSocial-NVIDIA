@@ -2,9 +2,10 @@
 y decide con libertad el formato y qué diapositivas llevan imagen."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 from utils import Agente, asegurar_imagenes, con_feedback, llamar_llm, parsear_json, recuperar_contexto_rag
-from config import MAX_DIAPOSITIVAS
+from config import HILOS_LOTES, MAX_DIAPOSITIVAS, REPARTIR_CON_IA
 
 MAX_POR_LOTE = 10   # diapositivas que se piden en una sola llamada a la IA
 
@@ -81,7 +82,12 @@ class Seccionador(Agente):
 
     def _repartir(self, entrada, feedback):
         """La IA decide cuántas diapositivas lleva cada tema. La fórmula de caracteres solo es una sugerencia;
-        si la IA falla, se usa la fórmula."""
+        si la IA falla, se usa la fórmula. Se puede desactivar (SECCIONADOR_REPARTO_IA=0) para ahorrar una llamada."""
+        if not REPARTIR_CON_IA:
+            return ([dict(f, sugeridas=f["diapositivas"],
+                          por_que="reparto por fórmula de caracteres (la IA se reserva para redactar)")
+                     for f in self.presupuesto],
+                    "Reparto por fórmula de caracteres; la IA se usa para redactar las diapositivas.")
         secciones = entrada.get("secciones", [])
         temas = [{"numero": f["numero"], "tema": f["tema"], "caracteres": f["caracteres"],
                   "sugeridas": f["diapositivas"],
@@ -201,14 +207,31 @@ class Seccionador(Agente):
         n_temas = len(presupuesto)
         n_chunks = len(entrada.get("indice_rag", []))
         slides, razones = [], []
+        metas, inicio = [], 1
         for j, lote in enumerate(lotes):
             primero, ultimo = j == 0, j == len(lotes) - 1
             esperadas = sum(f["diapositivas"] for f in lote) + (1 if primero else 0) + (1 if ultimo else 0)
-            data = self._pedir_lote(entrada, esquema, lote, primero, ultimo, esperadas, len(slides) + 1, feedback)
+            metas.append((j, lote, primero, ultimo, esperadas, inicio))
+            inicio += esperadas
+
+        def _armar_lote(meta):
+            _, lote, primero, ultimo, esperadas, inicio_lote = meta
+            data = self._pedir_lote(entrada, esquema, lote, primero, ultimo, esperadas, inicio_lote, feedback)
             nuevas = [dict(x) for x in data["slides"]]
             self._ajustar_temas(nuevas, lote, primero, ultimo, esperadas, n_temas)
+            return nuevas, str(data.get("razonamiento", "")).strip()
+
+        if len(metas) == 1:
+            resultados = [_armar_lote(metas[0])]
+        else:
+            # Cada bloque redacta diapositivas independientes: se piden en paralelo y se unen en orden.
+            print(f"[SECCIONADOR] Redactando {len(metas)} bloques en paralelo ({min(HILOS_LOTES, len(metas))} hilos)...",
+                  flush=True)
+            with ThreadPoolExecutor(max_workers=min(HILOS_LOTES, len(metas))) as pool:
+                resultados = list(pool.map(_armar_lote, metas))
+        for nuevas, razon in resultados:
             slides += nuevas
-            razones.append(str(data.get("razonamiento", "")).strip())
+            razones.append(razon)
 
         marcadas_ia = sum(1 for sl in slides if str(sl.get("lleva_imagen")).strip().lower() in ("true", "1", "si", "sí"))
         agregadas = asegurar_imagenes(slides)
@@ -217,10 +240,10 @@ class Seccionador(Agente):
         objetivo = sum(f["diapositivas"] for f in presupuesto) + 2
 
         detalle = [f"RAG activo: se consultaron fragmentos entre {n_chunks} chunks del PDF para enriquecer cada tema.",
-                   "Reparto decidido por la IA (la fórmula de caracteres del Jefe era solo una sugerencia):"]
+                   "Reparto de diapositivas por tema (la fórmula de caracteres del Jefe es la referencia):"]
         for f in presupuesto:
             detalle.append(f"   Tema {f['numero']} «{f['tema']}»: {f['caracteres']} caracteres, fórmula "
-                           f"{f['sugeridas']} → IA {f['diapositivas']} diapositiva(s). {f.get('por_que', '')}")
+                           f"{f['sugeridas']} → {f['diapositivas']} diapositiva(s). {f.get('por_que', '')}")
         detalle.append(f"   Criterio: {razon_reparto}")
         detalle.append(f"   Total: {objetivo} (con introducción y conclusión). Se trabajó en {len(lotes)} bloque(s) de temas.")
         detalle.append("")

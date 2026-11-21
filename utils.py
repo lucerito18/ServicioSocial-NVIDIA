@@ -7,9 +7,8 @@ import json
 import math
 import os
 import re
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
 from html import unescape
 from urllib.parse import quote, urlparse
 
@@ -23,7 +22,8 @@ from pptx.util import Pt
 
 from config import (CHARS_POR_DIAPOSITIVA, IMAGEN_RESPALDO_POLLINATIONS, IMAGEN_TIMEOUT, LIMITE_TEXTO_REVISION,
                     MAX_DIAP_POR_TEMA,
-                    MAX_DIAPOSITIVAS, MAX_TOKENS_SALIDA, MODEL_IMAGEN, MODEL_NAME, MODEL_VISION, NVIDIA_API_KEY,
+                    MAX_DIAPOSITIVAS, MAX_TEMAS, MAX_TOKENS_SALIDA, MODEL_IMAGEN, MODEL_NAME, MODEL_VISION,
+                    NVIDIA_API_KEY,
                     NVIDIA_BASE_URL,
                     NVIDIA_IMAGEN_URL, PROPORCION_IMAGENES, SIN_RAZONAMIENTO, TIMEOUT_LLM, USER_AGENT)
 
@@ -134,6 +134,18 @@ def validar_url_segura(url):
 
 _MAX_B64_VISION = 150_000   # la API de NVIDIA rechaza imágenes en base64 mayores a ~180 KB
 
+_sesion_local = threading.local()
+
+
+def _sesion():
+    """Una sesión HTTP por hilo: reutiliza la conexión TLS en vez de abrir una nueva en cada llamada."""
+    s = getattr(_sesion_local, "s", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update({"User-Agent": USER_AGENT, "Accept-Encoding": "gzip, deflate"})
+        _sesion_local.s = s
+    return s
+
 
 def _imagen_para_vision(datos):
     """Reduce una imagen (bytes) a JPEG pequeño para que quepa en el límite de la API de NVIDIA."""
@@ -175,45 +187,69 @@ def _a_mensajes(system_instruction, prompt):
 
 
 def _post_con_limite(url, limite, **kwargs):
-    """POST con límite de tiempo TOTAL. El 'timeout' de requests solo vigila la espera entre bytes: si el
-    servidor mantiene la conexión abierta sin contestar, nunca vence. Aquí se corta a los 'limite' segundos."""
-    ex = ThreadPoolExecutor(max_workers=1)
-    fut = ex.submit(requests.post, url, timeout=(15, limite), **kwargs)
+    """POST con límite de tiempo TOTAL y cierre real de la conexión.
+    El 'timeout' de requests solo vigila la espera entre bytes: si el servidor abre la conexión y no
+    contesta, nunca vence. Aquí se lee en streaming y se corta a los 'limite' segundos; al cerrar la
+    respuesta se libera el socket (antes el hilo quedaba colgado gastando cuota de la API)."""
+    inicio = time.time()
+    r = _sesion().post(url, stream=True, timeout=(10, limite), **kwargs)
+    trozos = []
     try:
-        return fut.result(timeout=limite)
-    except FutureTimeout:
-        raise TimeoutError(f"Timeout: NVIDIA no respondió en {limite}s") from None
+        for trozo in r.iter_content(64 * 1024):
+            if trozo:
+                trozos.append(trozo)
+            if time.time() - inicio > limite:
+                raise TimeoutError(f"Timeout: NVIDIA no respondió en {limite}s")
     finally:
-        ex.shutdown(wait=False)
+        r.close()
+    r._content = b"".join(trozos)
+    return r
 
 
-def llamar_llm(system_instruction, prompt):
+def llamar_llm(system_instruction, prompt, max_tokens=None):
     """Una llamada a NVIDIA NIM (chat/completions) blindada con REGLA_BLINDAJE_SISTEMA.
-    Reintenta con espera ante 429/5xx (el plan gratuito permite ~40 peticiones por minuto)."""
+    Reintenta con espera ante 429/5xx (el plan gratuito permite ~40 peticiones por minuto).
+    'max_tokens' permite acotar las respuestas cortas (revisiones) para que no se alarguen de más."""
     instruccion_segura = str(system_instruction).strip() + REGLA_BLINDAJE_SISTEMA
     mensajes, con_imagenes = _a_mensajes(instruccion_segura, prompt)
     cuerpo = {"model": MODEL_VISION if con_imagenes else MODEL_NAME, "messages": mensajes,
-              "temperature": 0.3, "max_tokens": MAX_TOKENS_SALIDA, "stream": False}
+              "temperature": 0.3, "max_tokens": int(max_tokens or MAX_TOKENS_SALIDA), "stream": False}
     if SIN_RAZONAMIENTO and not con_imagenes:
         cuerpo["chat_template_kwargs"] = {"enable_thinking": False}
     cabeceras = {"Authorization": f"Bearer {NVIDIA_API_KEY}", "Accept": "application/json"}
-    esperas = (5, 12, 25, 40)
+    esperas = (3, 8, 15)
     n_timeouts = 0
     for k in range(len(esperas) + 1):
         try:
             print(f"[LLM] Llamando a {cuerpo['model']} (intento {k + 1}, límite {TIMEOUT_LLM}s)...", flush=True)
             t0 = time.time()
             r = _post_con_limite(f"{NVIDIA_BASE_URL}/chat/completions", TIMEOUT_LLM, headers=cabeceras, json=cuerpo)
+            if r.status_code == 400 and "chat_template_kwargs" in cuerpo:
+                pista = r.text.lower()
+                if "chat_template" in pista or "enable_thinking" in pista or "extra" in pista:
+                    print("[LLM] El modelo no acepta 'enable_thinking'; reintento dejando su razonamiento normal.",
+                          flush=True)
+                    cuerpo.pop("chat_template_kwargs", None)
+                    r = _post_con_limite(f"{NVIDIA_BASE_URL}/chat/completions", TIMEOUT_LLM,
+                                         headers=cabeceras, json=cuerpo)
             print(f"[LLM] Respuesta en {time.time() - t0:.1f}s (HTTP {r.status_code})", flush=True)
             if r.status_code != 200:
                 raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
-            texto = (r.json()["choices"][0]["message"].get("content") or "")
-            texto = re.sub(r"<think>.*?</think>", "", texto, flags=re.DOTALL)
+            datos = r.json()
+            mensaje = (datos.get("choices") or [{}])[0].get("message") or {}
+            texto = mensaje.get("content") or ""
+            uso = datos.get("usage") or {}
+            detalles = uso.get("completion_tokens_details") or {}
+            razonamiento = detalles.get("reasoning_tokens")
+            print(f"[LLM] tokens: entrada={uso.get('prompt_tokens', '?')} salida={uso.get('completion_tokens', '?')}"
+                  + (f" razonamiento={razonamiento}" if razonamiento else ""), flush=True)
+            texto = re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>", "", texto, flags=re.DOTALL)
             return texto.strip()
         except Exception as e:
             descripcion = ocultar_secretos(f"{type(e).__name__} {e}")
             print(f"[LLM] Aviso en intento {k + 1}: {descripcion[:160]}", flush=True)
-            pasajero = any(t in descripcion for t in ("429", "502", "503", "504", "Timeout", "ConnectionError"))
+            pasajero = any(t in descripcion for t in ("429", "500", "502", "503", "504", "Timeout", "ReadTimeout",
+                                                      "ConnectionError"))
             if "Timeout" in descripcion:
                 n_timeouts += 1
                 if n_timeouts > 1:      # si ya se colgó dos veces, no seguir esperando más
@@ -223,22 +259,204 @@ def llamar_llm(system_instruction, prompt):
             time.sleep(esperas[k])
 
 
+# ==============================================================================
+# JSON tolerante: los modelos abiertos devuelven "casi JSON"
+# ==============================================================================
+
+_COMILLAS_JSON = {'"': '"', "'": "'", "“": "”", "”": "”", "‘": "’", "’": "’", "«": "»", "»": "»"}
+
+_ESCAPES_JSON = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+
+def _bloque_json(texto):
+    """Devuelve el trozo que va del primer '{' o '[' al último '}' o ']'."""
+    opciones = [(texto.find("{"), texto.rfind("}")), (texto.find("["), texto.rfind("]"))]
+    validos = [(a, b) for a, b in opciones if 0 <= a < b]
+    if not validos:
+        return texto
+    a, b = min(validos)
+    return texto[a:b + 1]
+
+
+def _json_tolerante(texto):
+    """Lee un JSON aunque tenga comas finales, claves sin comillas, comillas simples,
+    saltos de línea dentro de las cadenas o esté cortado a la mitad. Devuelve lo que haya."""
+    n = len(texto)
+    i = 0
+
+    def saltar():
+        nonlocal i
+        while i < n and texto[i] in " \t\r\n\ufeff\u00a0":
+            i += 1
+
+    def cadena():
+        nonlocal i
+        abre = texto[i]
+        cierra = _COMILLAS_JSON.get(abre, abre)
+        i += 1
+        trozos = []
+        while i < n:
+            c = texto[i]
+            if c == "\\" and i + 1 < n:
+                sig = texto[i + 1]
+                if sig in _ESCAPES_JSON:
+                    trozos.append(_ESCAPES_JSON[sig])
+                    i += 2
+                    continue
+                if sig == "u" and i + 5 < n:
+                    try:
+                        trozos.append(chr(int(texto[i + 2:i + 6], 16)))
+                        i += 6
+                        continue
+                    except ValueError:
+                        pass
+                trozos.append(sig)          # escape raro (\' o \x): se conserva el carácter
+                i += 2
+                continue
+            if c == cierra:
+                i += 1
+                return "".join(trozos)
+            if c in "\r\n":                 # salto de línea crudo dentro de la cadena
+                trozos.append(" ")
+                i += 1
+                continue
+            if c in "\t\v\f":
+                trozos.append(" ")
+                i += 1
+                continue
+            trozos.append(c)
+            i += 1
+        return "".join(trozos)              # cadena truncada por max_tokens
+
+    def objeto():
+        nonlocal i
+        i += 1
+        datos = {}
+        while True:
+            saltar()
+            if i >= n:
+                return datos
+            if texto[i] == "}":
+                i += 1
+                return datos
+            if texto[i] == ",":             # coma final o repetida
+                i += 1
+                continue
+            if texto[i] in _COMILLAS_JSON:
+                clave = cadena()
+            else:
+                m = re.match(r"[^:,\s\"'{}\[\]]+", texto[i:])
+                if not m:                   # basura suelta: se descarta
+                    i += 1
+                    continue
+                clave = m.group(0)
+                i += len(clave)
+            saltar()
+            if i < n and texto[i] == ":":
+                i += 1
+            else:                           # par sin dos puntos: se salta hasta el siguiente separador
+                while i < n and texto[i] not in ",}":
+                    i += 1
+                continue
+            try:
+                datos[clave.strip().strip("\"'")] = valor()
+            except ValueError:
+                return datos
+            saltar()
+
+    def lista():
+        nonlocal i
+        i += 1
+        datos = []
+        while True:
+            saltar()
+            if i >= n:
+                return datos
+            if texto[i] == "]":
+                i += 1
+                return datos
+            if texto[i] == ",":
+                i += 1
+                continue
+            try:
+                datos.append(valor())
+            except ValueError:
+                return datos
+            saltar()
+
+    def valor():
+        nonlocal i
+        saltar()
+        if i >= n:
+            raise ValueError("fin inesperado")
+        c = texto[i]
+        if c == "{":
+            return objeto()
+        if c == "[":
+            return lista()
+        if c in _COMILLAS_JSON:
+            return cadena()
+        for literal, dato in (("true", True), ("false", False), ("null", None),
+                              ("True", True), ("False", False), ("None", None), ("undefined", None)):
+            if texto.startswith(literal, i):
+                i += len(literal)
+                return dato
+        m = re.match(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", texto[i:])
+        if m:
+            i += len(m.group(0))
+            numero = m.group(0)
+            return float(numero) if ("." in numero or "e" in numero.lower()) else int(numero)
+        m = re.match(r"[^,}\]]+", texto[i:])   # texto sin comillas (NaN, una palabra...)
+        if not m:
+            raise ValueError(f"carácter inesperado {texto[i]!r}")
+        i += len(m.group(0))
+        return m.group(0).strip()
+
+    saltar()
+    return valor()
+
+
 def parsear_json(raw):
-    """Convierte la respuesta del modelo en JSON, quitando ``` si los puso o texto alrededor."""
-    raw = re.sub(r"^```(?:json)?", "", raw.strip())
-    raw = re.sub(r"```$", "", raw).strip()
+    """Convierte la respuesta del modelo en JSON.
+
+    Los modelos abiertos a veces devuelven ``` alrededor, una frase antes o después,
+    comas finales, claves sin comillas, comillas simples, saltos de línea dentro de las
+    cadenas o el JSON cortado por el tope de tokens. En vez de tumbar el pipeline, se
+    intenta leer de la forma más tolerante posible."""
+    texto = str(raw or "").strip()
+    texto = re.sub(r"^```(?:json)?", "", texto)
+    texto = re.sub(r"```$", "", texto).strip()
+    texto = texto.replace("\ufeff", "").replace("\u200b", "")
+    candidatos = [texto]
+    bloque = _bloque_json(texto)
+    if bloque != texto:
+        candidatos.append(bloque)
+
+    for candidato in candidatos:            # 1) JSON perfecto
+        try:
+            return json.loads(candidato)
+        except json.JSONDecodeError:
+            pass
+
+    for candidato in candidatos:            # 2) JSON "casi válido": se repara al vuelo
+        try:
+            dato = _json_tolerante(candidato)
+        except (ValueError, IndexError):
+            continue
+        if isinstance(dato, (dict, list)):
+            print(f"[JSON] Respuesta reparada ({len(candidato)} caracteres): el modelo no devolvió JSON "
+                  "estricto, pero se recuperó el contenido.", flush=True)
+            return dato
+
+    # 3) Nada funcionó: se dice exactamente dónde está el problema para que el
+    #    feedback del Jefe le pida al modelo corregirlo.
+    detalle = ""
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        # Los modelos abiertos a veces añaden una frase antes o después del JSON: nos quedamos con el bloque.
-        for ini, fin in (("{", "}"), ("[", "]")):
-            a, b = raw.find(ini), raw.rfind(fin)
-            if 0 <= a < b:
-                try:
-                    return json.loads(raw[a:b + 1])
-                except json.JSONDecodeError:
-                    pass
-        raise
+        json.loads(bloque)
+    except json.JSONDecodeError as e:
+        ini = max(0, e.pos - 70)
+        detalle = f" (columna {e.colno}: …{bloque[ini:e.pos + 70]}…)"
+    raise ValueError("La IA no devolvió un JSON válido" + detalle)
 
 
 def num_palabras(texto):
@@ -501,7 +719,7 @@ def _limpiar_url(u):
 
 def buscar_commons(consulta, limite=8):
     """Busca imagenes en Wikimedia Commons y devuelve solo las que traen autor y licencia libre."""
-    r = requests.get(
+    r = _sesion().get(
         validar_url_segura(_URL_COMMONS),
         params={
             "action": "query", "generator": "search", "gsrsearch": consulta,
@@ -537,7 +755,7 @@ def buscar_commons(consulta, limite=8):
 
 def descargar_imagen(url):
     url_segura = validar_url_segura(url)
-    r = requests.get(url_segura, headers={"User-Agent": USER_AGENT}, timeout=15)
+    r = _sesion().get(url_segura, headers={"User-Agent": USER_AGENT}, timeout=15)
     r.raise_for_status()
     mime = r.headers.get("Content-Type", "").split(";")[0]
     if mime not in ("image/jpeg", "image/png"):
@@ -589,7 +807,7 @@ def _a_jpeg_exacto(datos, ancho, alto):
     return salida.getvalue()
 
 
-def _imagen_nvidia(prompt, ancho, alto, intentos=3):
+def _imagen_nvidia(prompt, ancho, alto, intentos=2):
     """FLUX en NVIDIA (endpoint genai, no OpenAI). Pide 1024x768 y, si el modelo no acepta esa medida,
     pide 1024x1024 y recorta. Reintenta con espera ante 429/5xx."""
     url = f"{NVIDIA_IMAGEN_URL}/{MODEL_IMAGEN}"
@@ -608,7 +826,7 @@ def _imagen_nvidia(prompt, ancho, alto, intentos=3):
                 if r.status_code in (429, 500, 502, 503, 504):
                     ultimo = RuntimeError(f"HTTP {r.status_code}")
                     espera = r.headers.get("Retry-After", "")
-                    time.sleep(min(int(espera), 30) if espera.isdigit() else 5 * (k + 1))
+                    time.sleep(min(int(espera), 10) if espera.isdigit() else 3 * (k + 1))
                     continue
                 if r.status_code != 200:
                     raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
@@ -664,7 +882,7 @@ def _imagen_pollinations(prompt, ancho=800, alto=600, intentos=2):
             time.sleep(falta)
         _ultima = time.time()
         try:
-            r = requests.get(url, params={"width": ancho, "height": alto, "nologo": "true"},
+            r = _sesion().get(url, params={"width": ancho, "height": alto, "nologo": "true"},
                              headers={"User-Agent": USER_AGENT}, timeout=30)
             if r.status_code in (429, 500, 502, 503, 504):
                 ultimo_error = RuntimeError(f"HTTP {r.status_code}")
@@ -747,9 +965,10 @@ def _imagenes(slide):
 # ==============================================================================
 
 def rango_de_temas(paginas):
-    """Cuantos temas debe sacar el Recopilador segun el tamano del PDF (20 paginas -> de 6 a 20)."""
-    minimo = max(3, paginas // 3)
-    maximo = min(40, max(8, paginas))
+    """Cuantos temas debe sacar el Recopilador segun el tamano del PDF (20 paginas -> de 6 a 18).
+    El tope (MAX_TEMAS) evita pedir una respuesta gigantesca que se trunque y obligue a repetir."""
+    minimo = max(3, min(12, paginas // 3))
+    maximo = min(MAX_TEMAS, max(8, paginas))
     return minimo, max(minimo, maximo)
 
 

@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Copia de trabajo del repo SS-NVIDIA
+SS-NVIDIA/

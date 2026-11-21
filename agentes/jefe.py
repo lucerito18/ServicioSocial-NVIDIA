@@ -24,7 +24,7 @@ from agentes.lector import Lector
 from agentes.recopilador import Recopilador
 from agentes.seccionador import Seccionador
 from config import (COBERTURA_MINIMA, IMAGENES_POR_LOTE, LIMITE_TEXTO_REVISION, MAX_DIAPOSITIVAS, MAX_INTENTOS,
-                    PROPORCION_IMAGENES, TITULO_FUENTES)
+                    MAX_TOKENS_REVISION, PROPORCION_IMAGENES, REVISION_FINAL_IA, REVISION_IA_BLOQUEA, TITULO_FUENTES)
 
 SYS_JEFE = """
 Eres el Jefe supervisor de un equipo de agentes que convierte documentos en presentaciones.
@@ -49,6 +49,7 @@ class Jefe:
         self.objetivo = 0
         self.n_min, self.n_max = 3, MAX_DIAPOSITIVAS
         self.ultimo_intento = False
+        self.tiempos = {}
 
     def _anotar(self, agente, rol, intento, estado, segundos, res=None, revisiones=None, notas=""):
         res = res or {}
@@ -151,8 +152,12 @@ class Jefe:
                  "'referencias' debe ser una lista de máximo 8 elementos", bloquea=False)
             if isinstance(refs, list):
                 inventadas = [r for r in refs if not _referencia_en_texto(str(r), self.texto_pdf)]
+                if inventadas:
+                    # Se descartan en el momento: repetir todo el Recopilador costaría otra llamada enorme.
+                    s["referencias"] = [r for r in refs if r not in inventadas]
                 _chk(c, "Cada referencia aparece realmente en el texto del PDF", not inventadas,
-                     f"Referencias que no están en el PDF (posiblemente inventadas): {inventadas}")
+                     f"Se descartaron {len(inventadas)} referencias que no están en el PDF: {inventadas}",
+                     bloquea=False)
             if all(r["ok"] or not r["bloquea"] for r in c):
                 try:
                     r = self._revision_ia_temas(s)
@@ -162,7 +167,7 @@ class Jefe:
                              (["Temas que faltan: " + ", ".join(r["temas_faltantes"])] if r["temas_faltantes"] else [])
                              + (["Datos que no aparecen en el documento: " + "; ".join(r["datos_inventados"])]
                                 if r["datos_inventados"] else [])),
-                         bloquea=not self.ultimo_intento)
+                         bloquea=REVISION_IA_BLOQUEA and not self.ultimo_intento)
                     if r["temas_mezclados"]:
                         _chk(c, "Sugerencias de la IA sobre temas mezclados (no bloquean)", False,
                              " | ".join(r["temas_mezclados"]), bloquea=False)
@@ -177,14 +182,14 @@ class Jefe:
                     r = self._revision_ia_plan(s)
                     _chk(c, "Revisión con IA: fiel al documento, sin ideas repetidas y coherente",
                          not r["problemas_graves"], "La revisión con IA encontró: " + " | ".join(r["problemas_graves"]),
-                         bloquea=not self.ultimo_intento)
+                         bloquea=REVISION_IA_BLOQUEA and not self.ultimo_intento)
                     sc = [k for k in r["temas_sin_cubrir"] if 1 <= k <= self.n_temas]
                     cob = (self.n_temas - len(sc)) / self.n_temas if self.n_temas else 1
                     _chk(c, f"Revisión con IA: cobertura real de al menos el {round(COBERTURA_MINIMA * 100)}% de los temas",
                          cob >= COBERTURA_MINIMA,
                          "La IA considera que estos temas casi no se tratan: " + ", ".join(
                              f"{k} ({self.secciones[k - 1].get('tema', '?')})" for k in sc),
-                         bloquea=not self.ultimo_intento)
+                         bloquea=REVISION_IA_BLOQUEA and not self.ultimo_intento)
                     if r["sugerencias"]:
                         _chk(c, "Sugerencias de la IA (no bloquean)", False, " | ".join(r["sugerencias"]), bloquea=False)
                     if r["veredicto"]:
@@ -248,7 +253,7 @@ class Jefe:
                     rechazadas = self._revision_ia_imagenes(slides, imgs)
                     _chk(c, "Revisión con IA: cada imagen encaja con el tema de su diapositiva", not rechazadas,
                          "La IA vio que no encajan: " + " | ".join(f"diap. {n}: {m}" for n, m in rechazadas),
-                         bloquea=not self.ultimo_intento)
+                         bloquea=REVISION_IA_BLOQUEA and not self.ultimo_intento)
                 except Exception as e:
                     _chk(c, "Revisión con IA de las imágenes", False,
                          f"No se pudo ejecutar ({type(e).__name__}: {e})", bloquea=False)
@@ -397,7 +402,9 @@ class Jefe:
              f"su propia diapositiva ({minimo_cub} de {self.n_temas})",
              len(cubiertos) >= minimo_cub,
              "Ninguna diapositiva desarrolla los temas " + ", ".join(
-                 f"{k} ({self.secciones[k - 1].get('tema', '?')})" for k in faltan))
+                 f"{k} ({self.secciones[k - 1].get('tema', '?')})" for k in faltan)
+             + " (el Jefe los añadirá automáticamente al final, sin repetir todo el plan)",
+             bloquea=False)
 
         marcadas = [bool(sl.get("lleva_imagen")) for sl in slides]
         minimo_img = min_imagenes(n)
@@ -435,7 +442,7 @@ class Jefe:
             "DOCUMENTO:\n" + _recortar_texto(self.texto_original) + "\n\nRESUMEN DE TEMAS:\n"
             + json.dumps(temas, ensure_ascii=False) + "\n\nPLAN:\n" + json.dumps(plan, ensure_ascii=False)
         )
-        d = parsear_json(llamar_llm(SYS_JEFE, prompt))
+        d = parsear_json(llamar_llm(SYS_JEFE, prompt, max_tokens=MAX_TOKENS_REVISION))
         sin_cubrir = [x for x in d.get("temas_sin_cubrir", []) if isinstance(x, int) and not isinstance(x, bool)]
         return {"problemas_graves": [str(x) for x in d.get("problemas_graves", [])],
                 "sugerencias": [str(x) for x in d.get("sugerencias", [])],
@@ -457,16 +464,14 @@ class Jefe:
             '"veredicto": "<una frase>"}\n\nDOCUMENTO:\n' + _recortar_texto(self.texto_original)
             + "\n\nTEMAS:\n" + json.dumps(temas, ensure_ascii=False)
         )
-        d = parsear_json(llamar_llm(SYS_JEFE, prompt))
+        d = parsear_json(llamar_llm(SYS_JEFE, prompt, max_tokens=MAX_TOKENS_REVISION))
         lista = lambda k: [str(x) for x in d.get(k, []) if str(x).strip()]
         return {"temas_faltantes": lista("temas_faltantes"), "temas_mezclados": lista("temas_mezclados"),
                 "datos_inventados": lista("datos_inventados")}
 
     def _revision_ia_imagenes(self, slides, imgs):
-        """La IA del Jefe VE cada imagen junto al texto de su diapositiva y dice si encaja."""
-        rechazadas = []
-        for ini in range(0, len(imgs), IMAGENES_POR_LOTE):
-            lote = imgs[ini:ini + IMAGENES_POR_LOTE]
+        """La IA del Jefe VE cada imagen junto al texto de su diapositiva y dice si encaja (por lotes en paralelo)."""
+        def _revisar_lote(lote):
             partes = ['Para cada imagen di si ilustra con claridad el tema de su diapositiva. "encaja" es false '
                       "si no se relaciona, es confusa, ilegible o muestra algo distinto. Responde "
                       '{"resultados": [{"diapositiva": N, "encaja": true, "motivo": "<una frase>"}]}']
@@ -477,11 +482,23 @@ class Jefe:
                 with open(img["ruta"], "rb") as f:
                     partes.append({"mime_type": "image/png" if img["ruta"].lower().endswith(".png") else "image/jpeg",
                                    "data": f.read()})
-            d = parsear_json(llamar_llm(SYS_JEFE, partes))
+            salida = []
+            try:
+                d = parsear_json(llamar_llm(SYS_JEFE, partes, max_tokens=MAX_TOKENS_REVISION))
+            except Exception:
+                return salida
             for x in d.get("resultados", []):
                 if isinstance(x, dict) and x.get("encaja") is False and isinstance(x.get("diapositiva"), int):
-                    rechazadas.append((x["diapositiva"], str(x.get("motivo", "no encaja"))))
-        return rechazadas
+                    salida.append((x["diapositiva"], str(x.get("motivo", "no encaja"))))
+            return salida
+
+        lotes = [imgs[i:i + IMAGENES_POR_LOTE] for i in range(0, len(imgs), IMAGENES_POR_LOTE)]
+        if len(lotes) <= 1:
+            resultados = [_revisar_lote(lotes[0])] if lotes else []
+        else:
+            with ThreadPoolExecutor(max_workers=min(3, len(lotes))) as pool:
+                resultados = list(pool.map(_revisar_lote, lotes))
+        return [x for parcial in resultados for x in parcial]
 
     def _corregir_plan_ia(self, salida, problemas):
         """Cuando el Seccionador agota sus intentos, la IA del Jefe rehace el plan con las objeciones."""
@@ -525,7 +542,7 @@ class Jefe:
                 "DOCUMENTO:\n" + _recortar_texto(self.texto_original, LIMITE_TEXTO_REVISION)
                 + "\n\nPRESENTACIÓN:\n" + "\n".join(textos)
             )
-            d = parsear_json(llamar_llm(SYS_JEFE, prompt))
+            d = parsear_json(llamar_llm(SYS_JEFE, prompt, max_tokens=MAX_TOKENS_REVISION))
             detalle = ["Fortalezas:"] + [f"   + {x}" for x in d.get("fortalezas", [])]
             detalle += ["Problemas:"] + ([f"   - {x}" for x in d.get("problemas", [])] or ["   (ninguno)"])
             detalle.append(f"Agente a revisar: {d.get('agente_a_revisar') or 'ninguno'}")
@@ -682,9 +699,18 @@ class Jefe:
                                       "de los límites.",
                       "detalle": "\n".join(detalle)})
 
+    def _cronometrar(self, nombre, fn):
+        """Ejecuta una etapa y deja su duración en self.tiempos (visible en los logs de Render)."""
+        t0 = time.time()
+        try:
+            return fn()
+        finally:
+            self.tiempos[nombre] = round(time.time() - t0, 1)
+            print(f"[TIEMPO] {nombre}: {self.tiempos[nombre]}s", flush=True)
+
     def coordinar(self, pdf_path, ruta_pptx, carpeta):
         print(f"[JEFE] === Iniciando procesamiento de {os.path.basename(pdf_path)} ===", flush=True)
-        lectura = self._supervisar(Lector(carpeta), pdf_path)
+        lectura = self._cronometrar("Lector", lambda: self._supervisar(Lector(carpeta), pdf_path))
 
         # Paso de Seguridad (Guardian): valida el PDF, sanitiza el texto y los fragmentos RAG
         self._auditar_seguridad(pdf_path, lectura)
@@ -692,12 +718,27 @@ class Jefe:
         self.texto_original = lectura["texto"]
         self.rango_temas = rango_de_temas(max(1, int(lectura.get("paginas", 1))))
         self.texto_pdf = (lectura["texto"] + "\n" + lectura.get("texto_plumber", "")).lower()
-        resumen = self._supervisar(Recopilador(self.rango_temas), lectura)
+        resumen = self._cronometrar("Recopilador",
+                                    lambda: self._supervisar(Recopilador(self.rango_temas), lectura))
         resumen["indice_rag"] = lectura.get("indice_rag", [])
         self.secciones = resumen.get("secciones", [])
         self.n_temas = len(self.secciones)
         self._calcular_presupuesto()
-        plan = self._supervisar(Seccionador(self.presupuesto), resumen)
+        plan = self._cronometrar("Seccionador",
+                                 lambda: self._supervisar(Seccionador(self.presupuesto), resumen))
+        # Ajustes deterministas (temas sin diapositiva, bullets eternos, mínimo de imágenes):
+        # se aplican aquí para no repetir al Seccionador entero por detalles de forma.
+        plan, ajustes = self._corregir_plan(plan)
+        if ajustes:
+            self._anotar(self.nombre, "Aplica al plan los ajustes mínimos que exigen las reglas", "-",
+                         "🛠️ Ajuste automático del plan", 0,
+                         {"recibio": "Plan redactado por el Seccionador",
+                          "entrego": f"Plan de {len(plan['slides'])} diapositivas ajustado",
+                          "razonamiento": "En vez de pedirle al Seccionador que repita todas sus llamadas, apliqué "
+                                          "los ajustes deterministas (cobertura de temas, longitudes y mínimo de "
+                                          "imágenes) que garantizan las reglas.",
+                          "detalle": "\n".join(sorted(set(ajustes)))},
+                         self._checks_plan(plan["slides"], plan["razonamiento"], estricto=False))
         plan = {**plan, "documento": os.path.basename(pdf_path), "referencias": resumen.get("referencias", []),
                 "imagenes_pdf": lectura.get("imagenes_pdf", []), "secciones": self.secciones}
         respaldo = {**plan, "slides": [{k: v for k, v in s.items() if k != "imagen"} for s in plan["slides"]]}
@@ -706,17 +747,24 @@ class Jefe:
         # un hilo paralelo va redactando las Notas del Orador para ahorrar tiempo en el Generador.
         gen_agente = GeneradorPPTX(ruta_pptx)
         print("[JEFE] Lanzando en simultaneo: Ilustrador (imagenes) + Redaccion de Notas del Orador...", flush=True)
+        t0 = time.time()
         with ThreadPoolExecutor(max_workers=2) as pool:
             fut_notas = pool.submit(gen_agente._notas, plan)
             plan = self._supervisar(Ilustrador(carpeta), plan, opcional=True, respaldo=respaldo)
             try:
-                plan["notas_precalculadas"] = fut_notas.result(timeout=95)
+                # Sin límite: la redacción ya corre en paralelo con las imágenes. Si se corta la espera,
+                # el Generador tendría que pedir todas las notas otra vez y se perdería el ahorro.
+                plan["notas_precalculadas"] = fut_notas.result()
             except Exception:
                 plan["notas_precalculadas"] = {}
+        self.tiempos["Ilustrador + notas"] = round(time.time() - t0, 1)
+        print(f"[TIEMPO] Ilustrador + notas: {self.tiempos['Ilustrador + notas']}s", flush=True)
 
-        base = self._supervisar(gen_agente, plan)
-        final = self._supervisar(Decorador(), base)
-        self._revision_final(final["ruta"])
+        base = self._cronometrar("Generador", lambda: self._supervisar(gen_agente, plan))
+        final = self._cronometrar("Decorador", lambda: self._supervisar(Decorador(), base))
+        if REVISION_FINAL_IA:
+            self._cronometrar("Revisión final IA", lambda: self._revision_final(final["ruta"]))
+        print("[TIEMPO] Resumen: " + " · ".join(f"{k}={v}s" for k, v in self.tiempos.items()), flush=True)
         print(f"[JEFE] === Presentación completada en {round(time.time() - self.t_inicio, 1)}s ===", flush=True)
         return final["ruta"]
 

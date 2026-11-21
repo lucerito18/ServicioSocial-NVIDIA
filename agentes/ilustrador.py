@@ -12,6 +12,7 @@ from PIL import Image
 
 from utils import (Agente, buscar_commons, con_feedback, descargar_imagen,
                    generar_imagen_ia, llamar_llm, parsear_json)
+from config import CANDIDATAS_IMAGEN, HILOS_IMAGENES, MAX_IMAGENES_IA, VERIFICAR_IMAGENES_IA
 
 SYS_ILUSTRADOR_PLAN = """
 Eres un editor grafico que prepara las imagenes de una presentacion. Para cada diapositiva que se te
@@ -47,6 +48,7 @@ class Ilustrador(Agente):
         self.carpeta = carpeta
         self._feedback = None
         self._lock = threading.Lock()
+        self._ia_generadas = 0
 
     def _planear(self, slides, marcadas, imagenes_pdf, feedback):
         resumen = [{"diapositiva": i, "titulo": slides[i - 1].get("title", ""),
@@ -102,6 +104,8 @@ class Ilustrador(Agente):
 
     def _elegir(self, sl, candidatas, origen):
         """La IA mira las candidatas y elige una (o ninguna)."""
+        if not VERIFICAR_IMAGENES_IA:
+            return candidatas[0], "primera candidata (verificación con IA desactivada)"
         partes = [
             f"Diapositiva «{sl.get('title', '')}»\nContenido: {_texto(sl)[:350]}\n\n"
             f"Te muestro {len(candidatas)} imagen(es) candidata(s) de {origen} (numeradas del 1 al "
@@ -185,7 +189,7 @@ class Ilustrador(Agente):
                 if w < 400:
                     continue
                 bajadas.append({**h, "bytes": datos, "mime": mime, "ancho": w, "alto": al})
-                if len(bajadas) >= 3:
+                if len(bajadas) >= CANDIDATAS_IMAGEN:
                     break
             except Exception:
                 continue
@@ -237,7 +241,14 @@ class Ilustrador(Agente):
             elif fte == "web":
                 img, msg = self._probar_web(i, sl, p["consulta"], usadas)
             else:
-                img, msg = self._probar_ia(i, sl, p["prompt_ia"])
+                with self._lock:
+                    puede = self._ia_generadas < MAX_IMAGENES_IA
+                    if puede:
+                        self._ia_generadas += 1
+                if puede:
+                    img, msg = self._probar_ia(i, sl, p["prompt_ia"])
+                else:
+                    img, msg = None, f"límite de {MAX_IMAGENES_IA} ilustraciones IA alcanzado"
             if img:
                 colocada = img
                 intentos_txt.append(f"{fte}: OK ({msg})")
@@ -271,11 +282,12 @@ class Ilustrador(Agente):
 
         razon_plan, plan, completadas = self._planear(slides, marcadas, imagenes_pdf, feedback)
         usadas = set()
+        self._ia_generadas = 0
         conteo = {"pdf": 0, "web": 0, "ia": 0}
         resultados_ordenados = {}
 
-        # Ejecucion en SIMULTANEO con hasta 3 hilos paralelos para recortar el tiempo de espera
-        max_hilos = min(3, len(plan))
+        # Ejecucion en SIMULTANEO con varios hilos paralelos para recortar el tiempo de espera
+        max_hilos = min(HILOS_IMAGENES, len(plan))
         print(f"[ILUSTRADOR] Procesando {len(plan)} imagenes en simultaneo ({max_hilos} hilos paralelos)...", flush=True)
         with ThreadPoolExecutor(max_workers=max_hilos) as pool:
             futuros = {pool.submit(self._procesar_diapositiva, p, slides, imagenes_pdf, usadas): p["diapositiva"]

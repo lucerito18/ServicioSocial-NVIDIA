@@ -5,14 +5,15 @@ import gc
 import io
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 import pdfplumber
 from PIL import ImageStat
 
-from config import IMAGENES_POR_LOTE
+from config import IMAGENES_POR_LOTE, OCR_MAX_PAGINAS
 from utils import Agente, crear_indice_rag, llamar_llm, parsear_json
 
-MAX_PAGINAS_OCR = 30        # tope de páginas que se mandan al modelo de visión (cuida créditos y límite de 40 RPM)
+MAX_PAGINAS_OCR = OCR_MAX_PAGINAS      # tope de páginas que se mandan al modelo de visión (cuida créditos y tiempo)
 PAGINAS_POR_LLAMADA_OCR = max(1, min(2, IMAGENES_POR_LOTE))
 
 SYS_LECTOR = """
@@ -30,6 +31,18 @@ def _extraer_plumber(ruta):
         for p in pdf.pages:
             paginas.append(p.extract_text() or "")
     return paginas
+
+
+def _extraer_rapido(ruta):
+    """Texto con pypdf: 10-50 veces más rápido que pdfplumber, sobre todo con 0.1 CPU en Render Free.
+    Devuelve None si pypdf no está instalado o el PDF es problemático (se cae a pdfplumber)."""
+    try:
+        from pypdf import PdfReader
+        with open(ruta, "rb") as f:
+            lector = PdfReader(f)
+            return [p.extract_text() or "" for p in lector.pages]
+    except Exception:
+        return None
 
 
 SYS_LECTOR_IMG = """
@@ -62,10 +75,10 @@ def _transcribir_paginas_vision(ruta):
 
 
 def _describir_imagenes(imagenes):
-    """La IA mira las imagenes (por lotes), las describe y descarta logotipos, adornos e imagenes vacias."""
-    utiles, descartadas = [], 0
-    for ini in range(0, len(imagenes), IMAGENES_POR_LOTE):
-        lote = imagenes[ini:ini + IMAGENES_POR_LOTE]
+    """La IA mira las imagenes (por lotes en paralelo), las describe y descarta logotipos, adornos e imagenes vacias."""
+    lotes = [imagenes[i:i + IMAGENES_POR_LOTE] for i in range(0, len(imagenes), IMAGENES_POR_LOTE)]
+
+    def _procesar_lote(lote):
         partes = ["Estas imagenes salieron de un PDF. Para cada una devuelve 'descripcion' (una frase en espanol "
                   "de que muestra), 'tipo' (foto, diagrama, grafica, tabla u otro) y 'util' (true si sirve para "
                   "ilustrar contenido; false si es un logotipo, adorno, fondo, imagen casi vacia o ilegible). "
@@ -75,10 +88,19 @@ def _describir_imagenes(imagenes):
             with open(im["ruta"], "rb") as f:
                 partes.append({"mime_type": "image/jpeg", "data": f.read()})
         try:
-            info = {x.get("id"): x for x in parsear_json(llamar_llm(SYS_LECTOR_IMG, partes)).get("imagenes", [])
+            return {x.get("id"): x for x in parsear_json(llamar_llm(SYS_LECTOR_IMG, partes)).get("imagenes", [])
                     if isinstance(x, dict)}
         except Exception:
-            info = {}
+            return {}
+
+    if len(lotes) <= 1:
+        resultados = [_procesar_lote(lotes[0])] if lotes else []
+    else:
+        with ThreadPoolExecutor(max_workers=min(3, len(lotes))) as pool:
+            resultados = list(pool.map(_procesar_lote, lotes))
+
+    utiles, descartadas = [], 0
+    for lote, info in zip(lotes, resultados):
         for im in lote:
             x = info.get(im["id"])
             if x is not None and x.get("util") is False:
@@ -90,7 +112,7 @@ def _describir_imagenes(imagenes):
     return utiles, descartadas
 
 
-MAX_IMAGENES_PDF = 16       # reducido para cuidar RAM y llamadas a la API en Render Free
+MAX_IMAGENES_PDF = 12       # reducido para cuidar RAM y llamadas a la API en Render Free
 MAX_IMG_POR_PAGINA = 2
 
 
@@ -168,7 +190,10 @@ class Lector(Agente):
 
     def ejecutar(self, entrada, feedback=None):
         print(f"[LECTOR] Extrayendo texto de {os.path.basename(entrada)}...", flush=True)
-        paginas = _extraer_plumber(entrada)
+        paginas = _extraer_rapido(entrada)
+        via = "pypdf"
+        if paginas is None:
+            paginas, via = _extraer_plumber(entrada), "pdfplumber"
         t_plumber = "\n\n".join(t for t in paginas if t)
         vacias = sum(1 for t in paginas if not t or len(t.strip()) < 40)
 
@@ -189,7 +214,7 @@ class Lector(Agente):
         fuente, t_ia, nota = "pdfplumber", "", ""
         # Si pdfplumber ya extrajo texto solido en la mayoria de las paginas, lo usamos directo sin gastar 2 min en OCR
         if len(t_plumber.strip()) >= 400 and vacias <= len(paginas) * 0.4 and not feedback:
-            nota = "El PDF tiene texto digital nativo completo; se uso pdfplumber directo e indexacion RAG por pagina."
+            nota = "El PDF tiene texto digital nativo completo; se uso la extraccion directa e indexacion RAG por pagina."
         elif feedback:
             nota = "El Jefe rechazo la lectura anterior, asi que use el respaldo (pdfplumber)."
         else:
@@ -217,7 +242,7 @@ class Lector(Agente):
             lineas.append(f"Coincidencia de palabras con pdfplumber: {round(solap * 100)}%")
         lineas.append(f"Indice RAG creado en memoria: {len(indice_rag)} fragmentos por pagina listos para consulta.")
         lineas.append("")
-        lineas.append("Lectura por pagina (pdfplumber):")
+        lineas.append("Lectura por pagina (" + via + "):")
         for i, t in enumerate(paginas[:12], 1):
             muestra = t[:200].replace("\n", " ").strip()
             lineas.append(f"Pag. {i} ({len(t)} caracteres): {muestra}..." if t else f"Pag. {i}: sin texto extraible")

@@ -74,8 +74,9 @@ class GeneradorPPTX(Agente):
             return {}
 
     def _notas(self, entrada):
-        """Si el Jefe ya precalculo las notas en paralelo con el Ilustrador, las reutiliza; si no, las pide en paralelo."""
-        if isinstance(entrada.get("notas_precalculadas"), dict) and entrada["notas_precalculadas"]:
+        """Si el Jefe ya precalculo las notas en paralelo con el Ilustrador, las reutiliza (aunque vengan vacias:
+        así no se repiten las llamadas); si no, las pide en paralelo."""
+        if isinstance(entrada.get("notas_precalculadas"), dict):
             return entrada["notas_precalculadas"]
         slides, secciones, notas = entrada["slides"], entrada.get("secciones", []) or [], {}
         bloques = []

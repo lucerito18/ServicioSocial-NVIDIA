@@ -6,10 +6,16 @@ import tempfile
 import threading
 import time
 
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+
 import gradio as gr
 
+from config import MODEL_NAME, MODEL_VISION, SIN_RAZONAMIENTO
 from utils import ErrorPipeline
 from agentes.jefe import Jefe
+
+print(f"[CONFIG] modelo={MODEL_NAME} vision={MODEL_VISION} "
+      f"razonamiento={'off' if SIN_RAZONAMIENTO else 'on'}", flush=True)
 
 
 def _memoria_mb():
@@ -89,4 +95,5 @@ demo = gr.Interface(
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+    demo.queue(max_size=4)
+    demo.launch(server_name="0.0.0.0", server_port=port, show_error=True)
